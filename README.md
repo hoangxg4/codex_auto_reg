@@ -11,13 +11,13 @@
 - 将注册codex邮箱服务从原先方案替换为 DuckMail API
 - 保留并扩展 Codex 协议 OAuth 流程
 - 输出 CLIProxyAPI v6 可识别的 Codex auth files
-- [management.html](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases)
 
 ## 包含内容
 
 - `chatgpt_register.py`：根目录下的 DuckMail 注册脚本
 - `codex/protocol_keygen.py`：纯 HTTP 的 Codex OAuth 注册与 token 生成脚本
 - `duckmaildoc.md`：DuckMail API 参考文档(https://raw.githubusercontent.com/MoonWeSif/DuckMail/main/public/llm-api-docs.txt)
+- [management.html](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases)
 
 ## 环境依赖
 
