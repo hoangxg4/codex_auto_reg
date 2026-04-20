@@ -41,6 +41,9 @@ def _load_config():
         "token_json_dir": "codex_tokens",
         "upload_api_url": "",
         "upload_api_token": "",
+        "manual_email_mode": False,
+        "manual_email": "",
+        "manual_email_password": "",
     }
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -67,6 +70,9 @@ def _load_config():
     config["token_json_dir"] = os.environ.get("TOKEN_JSON_DIR", config["token_json_dir"])
     config["upload_api_url"] = os.environ.get("UPLOAD_API_URL", config["upload_api_url"])
     config["upload_api_token"] = os.environ.get("UPLOAD_API_TOKEN", config["upload_api_token"])
+    config["manual_email_mode"] = os.environ.get("MANUAL_EMAIL_MODE", config["manual_email_mode"])
+    config["manual_email"] = os.environ.get("MANUAL_EMAIL", config["manual_email"])
+    config["manual_email_password"] = os.environ.get("MANUAL_EMAIL_PASSWORD", config["manual_email_password"])
 
     return config
 
@@ -95,11 +101,9 @@ RK_FILE = _CONFIG["rk_file"]
 TOKEN_JSON_DIR = _CONFIG["token_json_dir"]
 UPLOAD_API_URL = _CONFIG["upload_api_url"]
 UPLOAD_API_TOKEN = _CONFIG["upload_api_token"]
-
-if not DUCKMAIL_BEARER:
-    print("⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量")
-    print("   文件: config.json -> duckmail_bearer")
-    print("   环境变量: export DUCKMAIL_BEARER='your_api_key_here'")
+MANUAL_EMAIL_MODE = _as_bool(_CONFIG.get("manual_email_mode"))
+MANUAL_EMAIL = _CONFIG.get("manual_email", "")
+MANUAL_EMAIL_PASSWORD = _CONFIG.get("manual_email_password", "")
 
 # 全局线程锁
 _print_lock = threading.Lock()
@@ -878,6 +882,24 @@ class ChatGPTRegister:
         self._print(f"[OTP] 超时 ({timeout}s)")
         return None
 
+    def wait_for_verification_email_manual(self, timeout: int = 300):
+        """手动输入验证码"""
+        self._print(f"[OTP] 请在邮箱中查看验证码并输入 (超时 {timeout}s)...")
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            remaining = int(timeout - (time.time() - start_time))
+            self._print(f"[OTP] 等待输入验证码... ({remaining}s remaining)")
+            code = input("[OTP] 请输入6位验证码: ").strip()
+
+            if code and len(code) == 6 and code.isdigit():
+                return code
+
+            self._print("[!] 验证码必须是6位数字，请重试")
+
+        self._print(f"[OTP] 超时 ({timeout}s)")
+        return None
+
     # ==================== 注册流程 ====================
 
     def visit_homepage(self):
@@ -1038,8 +1060,11 @@ class ChatGPTRegister:
             need_otp = True
 
         if need_otp:
-            # 使用 DuckMail 等待验证码
-            otp_code = self.wait_for_verification_email(mail_token)
+            # 使用 DuckMail 或 Manual 模式等待验证码
+            if MANUAL_EMAIL_MODE:
+                otp_code = self.wait_for_verification_email_manual()
+            else:
+                otp_code = self.wait_for_verification_email(mail_token)
             if not otp_code:
                 raise Exception("未能获取验证码")
 
@@ -1049,7 +1074,10 @@ class ChatGPTRegister:
                 self._print("验证码失败，重试...")
                 self.send_otp()
                 _random_delay(1.0, 2.0)
-                otp_code = self.wait_for_verification_email(mail_token, timeout=60)
+                if MANUAL_EMAIL_MODE:
+                    otp_code = self.wait_for_verification_email_manual(timeout=60)
+                else:
+                    otp_code = self.wait_for_verification_email(mail_token, timeout=60)
                 if not otp_code:
                     raise Exception("重试后仍未获取验证码")
                 _random_delay(0.3, 0.8)
@@ -1545,7 +1573,7 @@ class ChatGPTRegister:
 
         if need_oauth_otp:
             self._print("[OAuth] 4/7 检测到邮箱 OTP 验证")
-            if not mail_token:
+            if not mail_token and not MANUAL_EMAIL_MODE:
                 self._print("[OAuth] OAuth 阶段需要邮箱 OTP，但未提供 mail_token")
                 return None
 
@@ -1554,67 +1582,109 @@ class ChatGPTRegister:
             otp_success = False
             otp_deadline = time.time() + 120
 
-            while time.time() < otp_deadline and not otp_success:
-                messages = self._fetch_emails_duckmail(mail_token) or []
-                candidate_codes = []
+            if MANUAL_EMAIL_MODE:
+                self._print("[OAuth] 手动模式: 请输入验证码")
+                while time.time() < otp_deadline and not otp_success:
+                    otp_code = input("[OAuth] 请输入6位验证码: ").strip()
+                    if otp_code and len(otp_code) == 6 and otp_code.isdigit():
+                        tried_codes.add(otp_code)
+                        self._print(f"[OAuth] 尝试 OTP: {otp_code}")
+                        try:
+                            resp_otp = self.session.post(
+                                f"{OAUTH_ISSUER}/api/accounts/email-otp/validate",
+                                json={"code": otp_code},
+                                headers=headers_otp,
+                                timeout=30,
+                                allow_redirects=False,
+                                impersonate=self.impersonate,
+                            )
+                        except Exception as e:
+                            self._print(f"[OAuth] email-otp/validate 异常: {e}")
+                            continue
 
-                for msg in messages[:12]:
-                    msg_id = msg.get("id") or msg.get("@id")
-                    if not msg_id:
+                        self._print(f"[OAuth] /email-otp/validate -> {resp_otp.status_code}")
+                        if resp_otp.status_code != 200:
+                            self._print(f"[OAuth] OTP 无效: {resp_otp.text[:160]}")
+                            continue
+
+                        try:
+                            otp_data = resp_otp.json()
+                        except Exception:
+                            self._print("[OAuth] email-otp/validate 响应解析失败")
+                            continue
+
+                        continue_url = otp_data.get("continue_url", "") or continue_url
+                        page_type = (otp_data.get("page") or {}).get("type", "") or page_type
+                        self._print(f"[OAuth] OTP 验证通过 page={page_type or '-'} next={(continue_url or '-')[:140]}")
+                        otp_success = True
+                        break
+                    else:
+                        self._print("[!] 验证码必须是6位数字")
+                if not otp_success:
+                    self._print(f"[OAuth] OAuth 阶段 OTP 验证失败")
+                    return None
+            else:
+                while time.time() < otp_deadline and not otp_success:
+                    messages = self._fetch_emails_duckmail(mail_token) or []
+                    candidate_codes = []
+
+                    for msg in messages[:12]:
+                        msg_id = msg.get("id") or msg.get("@id")
+                        if not msg_id:
+                            continue
+                        detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
+                        if not detail:
+                            continue
+                        content = detail.get("text") or detail.get("html") or ""
+                        code = self._extract_verification_code(content)
+                        if code and code not in tried_codes:
+                            candidate_codes.append(code)
+
+                    if not candidate_codes:
+                        elapsed = int(120 - max(0, otp_deadline - time.time()))
+                        self._print(f"[OAuth] OTP 等待中... ({elapsed}s/120s)")
+                        time.sleep(2)
                         continue
-                    detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
-                    if not detail:
-                        continue
-                    content = detail.get("text") or detail.get("html") or ""
-                    code = self._extract_verification_code(content)
-                    if code and code not in tried_codes:
-                        candidate_codes.append(code)
 
-                if not candidate_codes:
-                    elapsed = int(120 - max(0, otp_deadline - time.time()))
-                    self._print(f"[OAuth] OTP 等待中... ({elapsed}s/120s)")
-                    time.sleep(2)
-                    continue
+                    for otp_code in candidate_codes:
+                        tried_codes.add(otp_code)
+                        self._print(f"[OAuth] 尝试 OTP: {otp_code}")
+                        try:
+                            resp_otp = self.session.post(
+                                f"{OAUTH_ISSUER}/api/accounts/email-otp/validate",
+                                json={"code": otp_code},
+                                headers=headers_otp,
+                                timeout=30,
+                                allow_redirects=False,
+                                impersonate=self.impersonate,
+                            )
+                        except Exception as e:
+                            self._print(f"[OAuth] email-otp/validate 异常: {e}")
+                            continue
 
-                for otp_code in candidate_codes:
-                    tried_codes.add(otp_code)
-                    self._print(f"[OAuth] 尝试 OTP: {otp_code}")
-                    try:
-                        resp_otp = self.session.post(
-                            f"{OAUTH_ISSUER}/api/accounts/email-otp/validate",
-                            json={"code": otp_code},
-                            headers=headers_otp,
-                            timeout=30,
-                            allow_redirects=False,
-                            impersonate=self.impersonate,
-                        )
-                    except Exception as e:
-                        self._print(f"[OAuth] email-otp/validate 异常: {e}")
-                        continue
+                        self._print(f"[OAuth] /email-otp/validate -> {resp_otp.status_code}")
+                        if resp_otp.status_code != 200:
+                            self._print(f"[OAuth] OTP 无效，继续尝试下一条: {resp_otp.text[:160]}")
+                            continue
 
-                    self._print(f"[OAuth] /email-otp/validate -> {resp_otp.status_code}")
-                    if resp_otp.status_code != 200:
-                        self._print(f"[OAuth] OTP 无效，继续尝试下一条: {resp_otp.text[:160]}")
-                        continue
+                        try:
+                            otp_data = resp_otp.json()
+                        except Exception:
+                            self._print("[OAuth] email-otp/validate 响应解析失败")
+                            continue
 
-                    try:
-                        otp_data = resp_otp.json()
-                    except Exception:
-                        self._print("[OAuth] email-otp/validate 响应解析失败")
-                        continue
+                        continue_url = otp_data.get("continue_url", "") or continue_url
+                        page_type = (otp_data.get("page") or {}).get("type", "") or page_type
+                        self._print(f"[OAuth] OTP 验证通过 page={page_type or '-'} next={(continue_url or '-')[:140]}")
+                        otp_success = True
+                        break
 
-                    continue_url = otp_data.get("continue_url", "") or continue_url
-                    page_type = (otp_data.get("page") or {}).get("type", "") or page_type
-                    self._print(f"[OAuth] OTP 验证通过 page={page_type or '-'} next={(continue_url or '-')[:140]}")
-                    otp_success = True
-                    break
+                    if not otp_success:
+                        time.sleep(2)
 
                 if not otp_success:
-                    time.sleep(2)
-
-            if not otp_success:
-                self._print(f"[OAuth] OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码")
-                return None
+                    self._print(f"[OAuth] OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码")
+                    return None
 
         code = None
         consent_url = continue_url
@@ -1694,16 +1764,28 @@ class ChatGPTRegister:
 # ==================== 并发批量注册 ====================
 
 def _register_one(idx, total, proxy, output_file):
-    """单个注册任务 (在线程中运行) - 使用 DuckMail 临时邮箱"""
+    """单个注册任务 (在线程中运行) - 使用 DuckMail 或 manual email"""
     reg = None
+    email = ""
+    email_pwd = ""
+    chatgpt_password = ""
     try:
         reg = ChatGPTRegister(proxy=proxy, tag=f"{idx}")
 
-        # 1. 创建 DuckMail 临时邮箱
-        reg._print("[DuckMail] 创建临时邮箱...")
-        email, email_pwd, mail_token = reg.create_temp_email()
-        tag = email.split("@")[0]
-        reg.tag = tag  # 更新 tag
+        if MANUAL_EMAIL_MODE:
+            email = MANUAL_EMAIL
+            email_pwd = MANUAL_EMAIL_PASSWORD
+            mail_token = None
+            if not email:
+                raise Exception("manual_email_mode=True 但未设置 manual_email")
+            tag = email.split("@")[0]
+            reg.tag = tag
+            reg._print(f"[Manual] 使用手动邮箱: {email}")
+        else:
+            reg._print("[DuckMail] 创建临时邮箱...")
+            email, email_pwd, mail_token = reg.create_temp_email()
+            tag = email.split("@")[0]
+            reg.tag = tag
 
         chatgpt_password = _generate_password()
         name = _random_name()
@@ -1713,15 +1795,18 @@ def _register_one(idx, total, proxy, output_file):
             print(f"\n{'='*60}")
             print(f"  [{idx}/{total}] 注册: {email}")
             print(f"  ChatGPT密码: {chatgpt_password}")
-            print(f"  邮箱密码: {email_pwd}")
+            if MANUAL_EMAIL_MODE:
+                print(f"  邮箱密码: (手动模式)")
+            else:
+                print(f"  邮箱密码: {email_pwd}")
             print(f"  姓名: {name} | 生日: {birthdate}")
             print(f"{'='*60}")
 
-        # 2. 执行注册流程
         reg.run_register(email, chatgpt_password, name, birthdate, mail_token)
 
-        # 3. OAuth（可选）
-        oauth_ok = True
+        # 3. OAuth（可选）- Không fail nếu OAuth lỗi
+        oauth_ok = False
+        oauth_error = ""
         if ENABLE_OAUTH:
             reg._print("[OAuth] 开始获取 Codex Token...")
             tokens = reg.perform_codex_oauth_login_http(email, chatgpt_password, mail_token=mail_token)
@@ -1730,22 +1815,37 @@ def _register_one(idx, total, proxy, output_file):
                 _save_codex_tokens(email, tokens)
                 reg._print("[OAuth] Token 已保存")
             else:
-                msg = "OAuth 获取失败"
-                if OAUTH_REQUIRED:
-                    raise Exception(f"{msg}（oauth_required=true）")
-                reg._print(f"[OAuth] {msg}（按配置继续）")
+                oauth_error = "OAuth获取失败"
+                reg._print(f"[OAuth] {oauth_error}（继续保存注册结果）")
 
-        # 4. 线程安全写入结果
+        # 4. Ghi file riêng
+        # chatgpt.txt - registration status
+        chatgpt_line = f"{email}----{chatgpt_password}----{email_pwd or '(manual)'}"
         with _file_lock:
-            with open(output_file, "a", encoding="utf-8") as out:
-                out.write(f"{email}----{chatgpt_password}----{email_pwd}----oauth={'ok' if oauth_ok else 'fail'}\n")
+            with open("chatgpt.txt", "a", encoding="utf-8") as out:
+                out.write(chatgpt_line + "\n")
+
+        # codex.txt - OAuth status
+        codex_line = f"{email}----{chatgpt_password}----{'ok' if oauth_ok else 'fail'}"
+        with _file_lock:
+            with open("codex.txt", "a", encoding="utf-8") as out:
+                out.write(codex_line + "\n")
 
         with _print_lock:
-            print(f"\n[OK] [{tag}] {email} 注册成功!")
+            print(f"\n[OK] [{tag}] {email} 注册成功! (OAuth: {'ok' if oauth_ok else 'fail'})")
         return True, email, None
 
     except Exception as e:
         error_msg = str(e)
+        if not email:
+            email = "unknown"
+        if not chatgpt_password:
+            chatgpt_password = "unknown"
+        # Ghi fail vào chatgpt.txt
+        chatgpt_line = f"{email}----{chatgpt_password}----fail"
+        with _file_lock:
+            with open("chatgpt.txt", "a", encoding="utf-8") as out:
+                out.write(chatgpt_line + "\n")
         with _print_lock:
             print(f"\n[FAIL] [{idx}] 注册失败: {error_msg}")
             traceback.print_exc()
@@ -1754,19 +1854,27 @@ def _register_one(idx, total, proxy, output_file):
 
 def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
               max_workers=3, proxy=None):
-    """并发批量注册 - DuckMail 临时邮箱版"""
+    """并发批量注册 - 手动邮箱版"""
 
-    if not DUCKMAIL_BEARER:
-        print("❌ 错误: 未设置 DUCKMAIL_BEARER 环境变量")
-        print("   请设置: export DUCKMAIL_BEARER='your_api_key_here'")
-        print("   或: set DUCKMAIL_BEARER=your_api_key_here (Windows)")
-        return
+    if MANUAL_EMAIL_MODE:
+        email_display = MANUAL_EMAIL
+    else:
+        if not DUCKMAIL_BEARER:
+            print("❌ 错误: 未设置 DUCKMAIL_BEARER 环境变量")
+            print("   请设置: export DUCKMAIL_BEARER='your_api_key_here'")
+            print("   或: set DUCKMAIL_BEARER=your_api_key_here (Windows)")
+            return
+        email_display = DUCKMAIL_API_BASE
 
     actual_workers = min(max_workers, total_accounts)
+    mode_label = "手动邮箱" if MANUAL_EMAIL_MODE else "DuckMail临时邮箱"
     print(f"\n{'#'*60}")
-    print(f"  ChatGPT 批量自动注册 (DuckMail 临时邮箱版)")
+    print(f"  ChatGPT 批量自动注册 ({mode_label})")
     print(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
-    print(f"  DuckMail: {DUCKMAIL_API_BASE}")
+    if MANUAL_EMAIL_MODE:
+        print(f"  邮箱: {email_display}")
+    else:
+        print(f"  DuckMail: {email_display}")
     print(f"  OAuth: {'开启' if ENABLE_OAUTH else '关闭'} | required: {'是' if OAUTH_REQUIRED else '否'}")
     if ENABLE_OAUTH:
         print(f"  OAuth Issuer: {OAUTH_ISSUER}")
@@ -1813,18 +1921,19 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
 
 
 def main():
+    global MANUAL_EMAIL_MODE, MANUAL_EMAIL, MANUAL_EMAIL_PASSWORD
+
     print("=" * 60)
-    print("  ChatGPT 批量自动注册工具 (DuckMail 临时邮箱版)")
+    print("  ChatGPT 批量自动注册工具 (手动邮箱模式)")
     print("=" * 60)
 
-    # 检查 DuckMail 配置
-    if not DUCKMAIL_BEARER:
-        print("\n⚠️  警告: 未设置 DUCKMAIL_BEARER")
-        print("   请编辑 config.json 设置 duckmail_bearer，或设置环境变量:")
-        print("   Windows: set DUCKMAIL_BEARER=your_api_key_here")
-        print("   Linux/Mac: export DUCKMAIL_BEARER='your_api_key_here'")
-        print("\n   按 Enter 继续尝试运行 (可能会失败)...")
-        input()
+    MANUAL_EMAIL_MODE = True
+    MANUAL_EMAIL = input("\n输入邮箱地址 (如 user@gmail.com): ").strip()
+    MANUAL_EMAIL_PASSWORD = ""
+    if not MANUAL_EMAIL:
+        print("[!] 未输入邮箱，退出")
+        return
+    print(f"[Info] 手动模式: {MANUAL_EMAIL}")
 
     # 交互式代理配置
     proxy = DEFAULT_PROXY

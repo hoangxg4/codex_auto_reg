@@ -1,11 +1,11 @@
 {
-    "total_accounts": 3,
+    "total_accounts": 1,
     "duckmail_api_base": "https://api.duckmail.sbs",
     "duckmail_bearer": "",
-    "proxy": "http://127.0.0.1:7897",
+    "proxy": "",
     "output_file": "registered_accounts.txt",
     "enable_oauth": true,
-    "oauth_required": true,
+    "oauth_required": false,
     "oauth_issuer": "https://auth.openai.com",
     "oauth_client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
     "oauth_redirect_uri": "http://localhost:1455/auth/callback",
@@ -13,5 +13,8 @@
     "rk_file": "rk.txt",
     "token_json_dir": "codex_tokens",
     "upload_api_url": "",
-    "upload_api_token": ""
+    "upload_api_token": "",
+    "manual_email_mode": false,
+    "manual_email": "",
+    "manual_email_password": ""
 }
